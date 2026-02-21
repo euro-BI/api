@@ -29,11 +29,13 @@ class QueryEngine:
             temp_dir = tempfile.gettempdir()
             logger.info(f"Usando diretório temporário: {temp_dir}")
             
-            # Conecta em memória com configurações específicas
-            self.con = duckdb.connect(database=':memory:', config={
-                'home_directory': temp_dir,
-                'extension_directory': os.path.join(temp_dir, 'duckdb_extensions')
-            })
+            # Conecta em memória SEM passar config no construtor para evitar erro "home_directory"
+            # Vercel/Lambda não permitem setar home_directory globalmente assim em versões recentes
+            self.con = duckdb.connect(database=':memory:')
+            
+            # Configura diretório de extensões via SQL, que é mais seguro
+            logger.info(f"Configurando extension_directory para: {temp_dir}")
+            self.con.execute(f"SET extension_directory='{temp_dir}';")
             
             logger.info("Conexão criada. Instalando extensões...")
             self.con.execute("INSTALL httpfs;")
