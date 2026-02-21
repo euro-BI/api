@@ -2,13 +2,22 @@ from app.core.config import get_settings
 import duckdb
 import threading
 import json
+import os
+import tempfile
 
 settings = get_settings()
 
 class QueryEngine:
     def __init__(self):
-        # Conecta em memória (DuckDB é muito leve)
-        self.con = duckdb.connect(database=':memory:')
+        # Configura diretório temporário para extensões (Vercel/Lambda são read-only exceto /tmp)
+        # Isso evita erro de permissão ao tentar instalar/carregar extensões
+        temp_dir = tempfile.gettempdir()
+        
+        # Conecta em memória com configurações específicas
+        self.con = duckdb.connect(database=':memory:', config={
+            'home_directory': temp_dir,
+            'extension_directory': os.path.join(temp_dir, 'duckdb_extensions')
+        })
         self.lock = threading.Lock()
         self._setup_s3()
 
