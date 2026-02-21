@@ -4,95 +4,116 @@ import threading
 import json
 import os
 import tempfile
+import logging
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 class QueryEngine:
     def __init__(self):
-        # Configura diretório temporário para extensões (Vercel/Lambda são read-only exceto /tmp)
-        # Isso evita erro de permissão ao tentar instalar/carregar extensões
-        temp_dir = tempfile.gettempdir()
-        
-        # Conecta em memória com configurações específicas
-        self.con = duckdb.connect(database=':memory:', config={
-            'home_directory': temp_dir,
-            'extension_directory': os.path.join(temp_dir, 'duckdb_extensions')
-        })
+        # Lazy initialization: não conecta nem instala extensões no boot
+        self.con = None
         self.lock = threading.Lock()
-        self._setup_s3()
-
-    def _setup_s3(self):
-        """
-        Configura as credenciais e extensões do DuckDB para acessar S3
-        """
-        self.con.execute("INSTALL httpfs;")
-        self.con.execute("LOAD httpfs;")
-        self.con.execute("INSTALL aws;")
-        self.con.execute("LOAD aws;")
         
-        # Tratamento do endpoint (DuckDB não gosta de 'https://' no s3_endpoint em algumas versões)
-        # O S3 Endpoint do Supabase geralmente é algo como: region.project.supabase.co
-        # DuckDB prefere o estilo path ou vhost. Para S3 compatible, path style costuma ser mais seguro.
-        
-        endpoint = settings.SUPABASE_S3_ENDPOINT.replace("https://", "").replace("http://", "")
-        if endpoint.endswith("/"):
-            endpoint = endpoint[:-1]
+    def _get_connection(self):
+        """
+        Garante que a conexão existe e está configurada.
+        Se não estiver, cria e configura.
+        """
+        if self.con is not None:
+            return self.con
             
-        # IMPORTANTE: DuckDB tem configurações específicas para S3 Compatible (MinIO, Supabase, R2)
-        # s3_url_style='path' é crucial para Supabase Storage
-        query = f"""
-        SET s3_region='{settings.AWS_DEFAULT_REGION}';
-        SET s3_endpoint='{endpoint}';
-        SET s3_access_key_id='{settings.AWS_ACCESS_KEY_ID}';
-        SET s3_secret_access_key='{settings.AWS_SECRET_ACCESS_KEY}';
-        SET s3_url_style='path';
-        SET s3_use_ssl=true;
-        """
-        self.con.execute(query)
+        try:
+            logger.info("Iniciando conexão DuckDB...")
+            # Configura diretório temporário para extensões (Vercel/Lambda são read-only exceto /tmp)
+            temp_dir = tempfile.gettempdir()
+            logger.info(f"Usando diretório temporário: {temp_dir}")
+            
+            # Conecta em memória com configurações específicas
+            self.con = duckdb.connect(database=':memory:', config={
+                'home_directory': temp_dir,
+                'extension_directory': os.path.join(temp_dir, 'duckdb_extensions')
+            })
+            
+            logger.info("Conexão criada. Instalando extensões...")
+            self.con.execute("INSTALL httpfs;")
+            self.con.execute("LOAD httpfs;")
+            self.con.execute("INSTALL aws;")
+            self.con.execute("LOAD aws;")
+            logger.info("Extensões instaladas e carregadas.")
+            
+            # Tratamento do endpoint
+            endpoint = settings.SUPABASE_S3_ENDPOINT.replace("https://", "").replace("http://", "")
+            if endpoint.endswith("/"):
+                endpoint = endpoint[:-1]
+                
+            logger.info(f"Configurando S3 com endpoint: {endpoint}")
+            
+            query = f"""
+            SET s3_region='{settings.AWS_DEFAULT_REGION}';
+            SET s3_endpoint='{endpoint}';
+            SET s3_access_key_id='{settings.AWS_ACCESS_KEY_ID}';
+            SET s3_secret_access_key='{settings.AWS_SECRET_ACCESS_KEY}';
+            SET s3_url_style='path';
+            SET s3_use_ssl=true;
+            """
+            self.con.execute(query)
+            logger.info("Configuração S3 concluída.")
+            
+            return self.con
+            
+        except Exception as e:
+            logger.error(f"ERRO CRÍTICO ao inicializar DuckDB: {e}")
+            # Se falhar, reseta a conexão para tentar de novo na próxima chamada
+            self.con = None
+            raise e
 
     def get_parquet_data(self, filename: str, limit: int = 100):
         """
         Lê um arquivo parquet do bucket S3 e retorna como lista de dicionários.
         """
-        # Constrói o caminho s3://bucket/arquivo
-        # Nota: s3:// é o protocolo padrão do DuckDB para ler de S3
-        s3_path = f"s3://{settings.SUPABASE_BUCKET}/{filename}"
-        
-        # Query SQL direta no arquivo Parquet (Zero-Copy)
-        query = f"""
-        SELECT * 
-        FROM read_parquet('{s3_path}')
-        LIMIT {limit}
-        """
-        
-        # Retorna resultado como lista de dicts (JSON-friendly)
-        # .df() converte pra pandas
-        # Usamos to_json() -> json.loads() para garantir que Timestamps e NaNs sejam serializados corretamente
-        with self.lock:
-            df = self.con.execute(query).df()
-            return json.loads(df.to_json(orient="records", date_format="iso"))
+        try:
+            con = self._get_connection()
+            s3_path = f"s3://{settings.SUPABASE_BUCKET}/{filename}"
+            
+            query = f"""
+            SELECT * 
+            FROM read_parquet('{s3_path}')
+            LIMIT {limit}
+            """
+            
+            with self.lock:
+                df = con.execute(query).df()
+                return json.loads(df.to_json(orient="records", date_format="iso"))
+        except Exception as e:
+            logger.error(f"Erro em get_parquet_data: {e}")
+            raise e
 
     def execute_custom_query(self, sql: str):
         """
         Permite executar SQL arbitrário (com cuidado!)
         """
-        with self.lock:
-            df = self.con.execute(sql).df()
-            return json.loads(df.to_json(orient="records", date_format="iso"))
+        try:
+            con = self._get_connection()
+            with self.lock:
+                df = con.execute(sql).df()
+                return json.loads(df.to_json(orient="records", date_format="iso"))
+        except Exception as e:
+            logger.error(f"Erro em execute_custom_query: {e}")
+            raise e
 
     def list_tables(self):
         """
         Lista todos os arquivos .parquet no bucket S3.
         """
-        s3_path = f"s3://{settings.SUPABASE_BUCKET}/*.parquet"
-        # O glob retorna a coluna 'file' com o caminho completo
-        query = f"SELECT file FROM glob('{s3_path}')"
-        
-        with self.lock:
-            try:
+        try:
+            con = self._get_connection()
+            s3_path = f"s3://{settings.SUPABASE_BUCKET}/*.parquet"
+            query = f"SELECT file FROM glob('{s3_path}')"
+            
+            with self.lock:
                 # O glob do DuckDB retorna o caminho completo
-                # Ex: s3://bucket/arquivo.parquet
-                df = self.con.execute(query).df()
+                df = con.execute(query).df()
                 if df.empty:
                     return []
                 
@@ -106,10 +127,10 @@ class QueryEngine:
                     if name.endswith('.parquet'):
                         tables.append(name[:-8]) # Remove .parquet
                 return tables
-            except Exception as e:
-                # Se der erro (ex: bucket vazio ou erro de permissão), retorna lista vazia ou propaga log
-                print(f"Erro ao listar tabelas: {e}")
-                return []
+        except Exception as e:
+            logger.error(f"Erro ao listar tabelas: {e}")
+            # Propaga o erro para que o FastAPI retorne 500 e vejamos no log
+            raise e
 
 # Instância global (Singleton simples)
 query_engine = QueryEngine()
